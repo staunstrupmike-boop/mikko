@@ -19,10 +19,12 @@ using SharpDX.DirectWrite;
 // OrderFlowBubbles — NinjaTrader 8 Indicator
 //
 // Visualises live order-flow and L2 (DOM) positioning on a standard candle chart.
-// Each price level accumulates bid/ask volume per bar. The resulting "bubble" is
-// rendered directly on the chart panel: radius and opacity both scale with the
-// accumulated order size relative to the bar's maximum, so clusters glow large
-// and bright while thin levels stay small and faint.
+// The full order book is mirrored position-by-position from OnMarketDepth. For
+// each bar, every price in the top DomDepth rows is credited with size × seconds
+// resting on the book, so orders that sit there outweigh orders that flash in and
+// out. The resulting "bubble" is rendered directly on the chart panel: radius and
+// opacity both scale with that resting size relative to the bar's maximum, so
+// clusters glow large and bright while thin levels stay small and faint.
 //
 // Cluster projection: a weighted-average of the last N bars' dominant levels is
 // used to draw a projected cluster zone 6 bars to the right of the last painted
@@ -47,12 +49,24 @@ namespace NinjaTrader.NinjaScript.Indicators
         // One slot per completed bar; keyed by bar index → list of price levels
         private Dictionary<int, List<BubbleEntry>> _barBubbles;
 
-        // Accumulator for the bar currently forming
+        // Accumulator for the bar currently forming (price → size-seconds on book)
         private Dictionary<double, BubbleEntry> _liveLevels;
 
-        // DOM snapshot (price → size) refreshed on each market-depth update
-        private Dictionary<double, double> _domBid;
-        private Dictionary<double, double> _domAsk;
+        private class BookLevel { public double Price; public long Volume; }
+
+        // Depth operations address rows by Position, so the whole book is kept even
+        // though only the top DomDepth rows are read.
+        private readonly List<BookLevel> _bids = new List<BookLevel>();
+        private readonly List<BookLevel> _asks = new List<BookLevel>();
+        private DateTime _lastBookTime = DateTime.MinValue;
+
+        // Caps the credit for a quiet spell (session gap, reconnect) so it can't swamp a bar
+        private const double MaxBookGapSeconds = 5.0;
+
+        // Depth/bar events and OnRender run on different threads
+        private readonly object _sync = new object();
+
+        private MasterInstrument _mi;
 
         // Cluster-projection state (updated when a bar closes)
         private double _projectedPrice;
@@ -128,17 +142,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ProjectionColor = Colors.Yellow;
                 MinOpacity      = 0.2;
             }
-            else if (State == State.Configure)
-            {
-                // Subscribe to market depth (L2) on the primary instrument
-                AddDataSeries(BarsPeriodType.Tick, 1);
-            }
             else if (State == State.DataLoaded)
             {
                 _barBubbles  = new Dictionary<int, List<BubbleEntry>>();
                 _liveLevels  = new Dictionary<double, BubbleEntry>();
-                _domBid      = new Dictionary<double, double>();
-                _domAsk      = new Dictionary<double, double>();
+                _mi          = Instrument.MasterInstrument;
                 _projectionValid = false;
             }
             else if (State == State.Terminated)
@@ -151,37 +159,59 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
-            // Mirror the DOM snapshot; only track the configured depth
-            if (e.Position >= DomDepth) return;
+            lock (_sync)
+            {
+                // Credit the book as it stood up to this event, before mutating it
+                IntegrateBook(e.Time);
 
-            var dict = (e.MarketDataType == MarketDataType.Bid) ? _domBid : _domAsk;
+                if (e.IsReset) { _bids.Clear(); _asks.Clear(); return; }
 
-            if (e.Operation == Operation.Remove)
-                dict.Remove(e.Price);
-            else
-                dict[e.Price] = e.Volume;
+                List<BookLevel> side = e.MarketDataType == MarketDataType.Bid ? _bids
+                                     : e.MarketDataType == MarketDataType.Ask ? _asks
+                                     : null;
+                if (side == null) return;
 
-            // Absorb into the live bar accumulator
-            MergeDomIntoLive();
+                switch (e.Operation)
+                {
+                    case Operation.Add:
+                        if (e.Position <= side.Count)
+                            side.Insert(e.Position, new BookLevel { Price = e.Price, Volume = e.Volume });
+                        break;
+                    case Operation.Update:
+                        if (e.Position < side.Count) { side[e.Position].Price = e.Price; side[e.Position].Volume = e.Volume; }
+                        break;
+                    case Operation.Remove:
+                        if (e.Position < side.Count) side.RemoveAt(e.Position);
+                        break;
+                }
+            }
         }
 
-        private void MergeDomIntoLive()
+        private void IntegrateBook(DateTime now)
         {
-            foreach (var kv in _domBid)
+            if (_lastBookTime != DateTime.MinValue)
             {
-                double p = kv.Key;
-                if (!_liveLevels.TryGetValue(p, out var entry))
-                    entry = new BubbleEntry { Price = p };
-                entry.BidVol  += kv.Value;
-                entry.TotalVol = entry.BidVol + entry.AskVol;
-                _liveLevels[p] = entry;
+                double dt = Math.Min((now - _lastBookTime).TotalSeconds, MaxBookGapSeconds);
+                if (dt > 0)
+                {
+                    AccumulateSide(_bids, dt, true);
+                    AccumulateSide(_asks, dt, false);
+                }
             }
-            foreach (var kv in _domAsk)
+            if (now > _lastBookTime) _lastBookTime = now;
+        }
+
+        private void AccumulateSide(List<BookLevel> side, double dt, bool isBid)
+        {
+            int n = Math.Min(DomDepth, side.Count);
+            for (int i = 0; i < n; i++)
             {
-                double p = kv.Key;
-                if (!_liveLevels.TryGetValue(p, out var entry))
+                double p = _mi.RoundToTickSize(side[i].Price);
+                BubbleEntry entry;
+                if (!_liveLevels.TryGetValue(p, out entry))
                     entry = new BubbleEntry { Price = p };
-                entry.AskVol  += kv.Value;
+                if (isBid) entry.BidVol += side[i].Volume * dt;
+                else       entry.AskVol += side[i].Volume * dt;
                 entry.TotalVol = entry.BidVol + entry.AskVol;
                 _liveLevels[p] = entry;
             }
@@ -196,8 +226,11 @@ namespace NinjaTrader.NinjaScript.Indicators
             // On bar close snapshot the live levels into the completed-bar store
             if (IsFirstTickOfBar && CurrentBar > 0)
             {
-                SnapshotLiveBar(CurrentBar - 1);
-                UpdateClusterProjection();
+                lock (_sync)
+                {
+                    SnapshotLiveBar(CurrentBar - 1);
+                    UpdateClusterProjection();
+                }
             }
 
             // Always force a repaint so the live bubble updates each tick
@@ -257,41 +290,50 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             EnsureBrushes();
 
-            int firstBar = ChartBars.FromIndex;
-            int lastBar  = ChartBars.ToIndex;
+            int firstBar    = ChartBars.FromIndex;
+            int lastBar     = ChartBars.ToIndex;
+            int lastDataBar = ChartBars.Count - 1;
+
+            // Copy under the lock, draw outside it; completed-bar lists are never mutated
+            var visible = new List<KeyValuePair<int, List<BubbleEntry>>>();
+            List<BubbleEntry> live;
+            lock (_sync)
+            {
+                for (int barIndex = firstBar; barIndex <= lastBar; barIndex++)
+                {
+                    List<BubbleEntry> levels;
+                    if (_barBubbles.TryGetValue(barIndex, out levels))
+                        visible.Add(new KeyValuePair<int, List<BubbleEntry>>(barIndex, levels));
+                }
+                live = new List<BubbleEntry>(_liveLevels.Values);
+            }
 
             // ── render historical bars ────────────────────────────────────────
-            for (int barIndex = firstBar; barIndex <= lastBar; barIndex++)
+            foreach (var bar in visible)
             {
-                if (!_barBubbles.TryGetValue(barIndex, out var levels)) continue;
-
                 double barMax = 0;
-                foreach (var e in levels) barMax = Math.Max(barMax, e.TotalVol);
+                foreach (var e in bar.Value) barMax = Math.Max(barMax, e.TotalVol);
                 if (barMax <= 0) continue;
 
-                float xCenter = (float)chartControl.GetXByBarIndex(ChartBars, barIndex);
+                float xCenter = (float)chartControl.GetXByBarIndex(ChartBars, bar.Key);
 
-                foreach (var entry in levels)
+                foreach (var entry in bar.Value)
                     DrawBubble(chartScale, xCenter, entry, barMax);
             }
 
             // ── render live bar (current forming bar) ─────────────────────────
-            if (_liveLevels.Count > 0)
+            double liveMax = 0;
+            foreach (var e in live) liveMax = Math.Max(liveMax, e.TotalVol);
+            if (liveMax > 0)
             {
-                double liveMax = 0;
-                foreach (var kv in _liveLevels) liveMax = Math.Max(liveMax, kv.Value.TotalVol);
-
-                if (liveMax > 0)
-                {
-                    float xCenter = (float)chartControl.GetXByBarIndex(ChartBars, CurrentBar);
-                    foreach (var kv in _liveLevels)
-                        DrawBubble(chartScale, xCenter, kv.Value, liveMax);
-                }
+                float xCenter = (float)chartControl.GetXByBarIndex(ChartBars, lastDataBar);
+                foreach (var e in live)
+                    DrawBubble(chartScale, xCenter, e, liveMax);
             }
 
             // ── render 6-bar forward cluster projection ───────────────────────
             if (_projectionValid)
-                DrawProjection(chartControl, chartScale, lastBar);
+                DrawProjection(chartControl, chartScale, lastDataBar);
         }
 
         private void DrawBubble(ChartScale chartScale, float xCenter, BubbleEntry entry, double barMax)
@@ -331,10 +373,10 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        private void DrawProjection(ChartControl chartControl, ChartScale chartScale, int lastBar)
+        private void DrawProjection(ChartControl chartControl, ChartScale chartScale, int lastDataBar)
         {
-            // Place projection zone 6 bars to the right of the last visible bar
-            int projBar = lastBar + 6;
+            // Anchored to the forming bar, not the last visible one, so scrolling doesn't move it
+            int projBar = lastDataBar + 6;
 
             // GetXByBarIndex returns valid coordinates even beyond the last rendered bar
             // because NT8 keeps the x-axis extended for right margin
