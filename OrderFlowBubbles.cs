@@ -258,7 +258,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             for (int i = 1; i <= ClusterLookback; i++)
             {
                 int barIndex = CurrentBar - i;
-                if (!_barBubbles.TryGetValue(barIndex, out var levels)) continue;
+                List<BubbleEntry> levels;
+                if (!_barBubbles.TryGetValue(barIndex, out levels)) continue;
 
                 double barMax = 0;
                 foreach (var e in levels) barMax = Math.Max(barMax, e.TotalVol);
@@ -443,10 +444,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private void ReleaseSharpDXResources()
         {
-            _bidBrush?.Dispose();         _bidBrush         = null;
-            _askBrush?.Dispose();         _askBrush         = null;
-            _projBrush?.Dispose();        _projBrush        = null;
-            _projOutlineBrush?.Dispose(); _projOutlineBrush = null;
+            if (_bidBrush         != null) { _bidBrush.Dispose();         _bidBrush         = null; }
+            if (_askBrush         != null) { _askBrush.Dispose();         _askBrush         = null; }
+            if (_projBrush        != null) { _projBrush.Dispose();        _projBrush        = null; }
+            if (_projOutlineBrush != null) { _projOutlineBrush.Dispose(); _projOutlineBrush = null; }
         }
 
         // Called by NT8 when the chart control is recreated (e.g. theme change)
