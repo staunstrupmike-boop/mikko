@@ -26,7 +26,9 @@
 //  tick stop / target, exit when bias flips past ExitBias, daily cap, time window, flat at
 //  session close. Nothing is sent to the broker unless EnableTrading is on.
 //
-//  Level 2 is live only. Keep the OrderFlowBubbles indicator on the chart for the map.
+//  Level 2 is live only. Trades are taken from the live feed too, so the strategy loads
+//  no extra history and starts at once. Keep the OrderFlowBubbles indicator on the chart
+//  for the map.
 // =====================================================================================
 
 #region Using declarations
@@ -189,7 +191,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                AddDataSeries(BarsPeriodType.Tick, 1);
+                // trades come from the live feed (OnMarketData); no tick history is loaded
                 SetStopLoss(CalculationMode.Ticks, StopTicks);
                 SetProfitTarget(CalculationMode.Ticks, TargetTicks);
             }
@@ -222,6 +224,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (e.MarketDataType == MarketDataType.Bid)      _liveBid = e.Price;
             else if (e.MarketDataType == MarketDataType.Ask) _liveAsk = e.Price;
+            else if (e.MarketDataType == MarketDataType.Last)
+            {
+                RecordTrade(e.Price, e.Volume, e.Time, e.Bid, e.Ask);
+                RequestRefresh();
+            }
         }
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
@@ -372,13 +379,6 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =================================================================================
         protected override void OnBarUpdate()
         {
-            if (BarsInProgress == 1)
-            {
-                if (CurrentBars[0] < 0 || !IsFirstTickOfBar) return;
-                RecordTrade(Closes[1][0], Volumes[1][0], Times[1][0]);
-                RequestRefresh();
-                return;
-            }
             if (BarsInProgress != 0) return;
 
             if (IsFirstTickOfBar && CurrentBar > BarsRequiredToTrade)
@@ -396,13 +396,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             RequestRefresh();
         }
 
-        private void RecordTrade(double price, double volume, DateTime time)
+        private void RecordTrade(double price, double volume, DateTime time, double bid, double ask)
         {
             if (volume <= 0) return;
             int side;
-            bool haveQuote = State == State.Realtime && _liveBid > 0 && _liveAsk > 0;
-            if (haveQuote && price >= _liveAsk)      side = 1;
-            else if (haveQuote && price <= _liveBid) side = -1;
+            bool haveQuote = bid > 0 && ask > 0;
+            if (haveQuote && price >= ask)      side = 1;
+            else if (haveQuote && price <= bid) side = -1;
             else if (price > _lastPrice)             side = 1;
             else if (price < _lastPrice)             side = -1;
             else                                     side = _lastSide;

@@ -14,6 +14,8 @@
 //    • Block-trade clusters: prices where at least BlockTradeThreshold contracts traded on
 //      one side in the current bar(s), grouped within ClusterRangeTicks, drawn as a band
 //      from the current bar across the right margin. Denser cluster = stronger band.
+//      Trades come from the live feed, so nothing extra is loaded; only "traded volume on
+//      bars" adds a 1-tick history series (slow to load on long charts).
 //    • Icebergs: a book row of at least LargeOrderThreshold that gets eaten and refilled
 //      IcebergRefills times is marked with a diamond at +1 (hidden size at that price).
 //    • Optional: traded volume per price on the bars themselves (off by default).
@@ -144,7 +146,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             else if (State == State.Configure)
             {
-                if (ShowTradeBubbles || ShowBlockClusters) AddDataSeries(BarsPeriodType.Tick, 1);
+                // only the on-bar history view needs a tick series; everything else is fed live
+                if (ShowTradeBubbles) AddDataSeries(BarsPeriodType.Tick, 1);
             }
             else if (State == State.DataLoaded)
             {
@@ -163,6 +166,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             if (e.MarketDataType == MarketDataType.Bid)      _liveBid = e.Price;
             else if (e.MarketDataType == MarketDataType.Ask) _liveAsk = e.Price;
+            else if (e.MarketDataType == MarketDataType.Last && !ShowTradeBubbles && State == State.Realtime)
+            {
+                RecordTrade(e.Price, e.Volume, e.Time, e.Bid, e.Ask);
+                RequestRefresh();
+            }
         }
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
@@ -286,21 +294,23 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (BarsInProgress == 1)
             {
                 if (CurrentBars[0] < 0 || !IsFirstTickOfBar) return;
-                RecordTrade(Closes[1][0], Volumes[1][0], Times[1][0]);
+                bool live = State == State.Realtime;
+                RecordTrade(Closes[1][0], Volumes[1][0], Times[1][0], live ? _liveBid : 0, live ? _liveAsk : 0);
                 RequestRefresh();
                 return;
             }
             if (BarsInProgress == 0) RequestRefresh();
         }
 
-        private void RecordTrade(double price, double volume, DateTime time)
+        // bid/ask = the quote at trade time when known (live); 0 = unknown, fall back to the tick rule
+        private void RecordTrade(double price, double volume, DateTime time, double bid, double ask)
         {
             if (volume <= 0) return;
 
             int side;
-            bool haveQuote = State == State.Realtime && _liveBid > 0 && _liveAsk > 0;
-            if (haveQuote && price >= _liveAsk)      side = 1;
-            else if (haveQuote && price <= _liveBid) side = -1;
+            bool haveQuote = bid > 0 && ask > 0;
+            if (haveQuote && price >= ask)      side = 1;
+            else if (haveQuote && price <= bid) side = -1;
             else if (price > _lastPrice)             side = 1;
             else if (price < _lastPrice)             side = -1;
             else                                     side = _lastSide;
@@ -645,7 +655,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         public double MaxOpacity { get; set; }
         [Display(Name = "Show pulled-order ghosts", Description = "Fading rings where orders were clustering but have been pulled", GroupName = "2. Bubbles", Order = 5)]
         public bool ShowGhosts { get; set; }
-        [Display(Name = "Show traded volume on bars", Description = "Also plot bid/ask traded volume per price on each bar (adds a 1-tick series)", GroupName = "2. Bubbles", Order = 6)]
+        [Display(Name = "Show traded volume on bars", Description = "Also plot bid/ask traded volume per price on each bar. Loads 1-tick history for the whole chart - slow on long charts, and the chart looks frozen while it loads", GroupName = "2. Bubbles", Order = 6)]
         public bool ShowTradeBubbles { get; set; }
         [Display(Name = "Show status line", GroupName = "2. Bubbles", Order = 7)]
         public bool ShowStatus { get; set; }
