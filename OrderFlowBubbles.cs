@@ -315,10 +315,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                     {
                         if (rows.ContainsKey(c.Price)) continue;
                         double persistRatio = Effective(c, now) / persistMax;
-                        if (persistRatio < 0.05) continue;
+                        if (persistRatio < 0.15) continue;
                         SharpDX.Direct2D1.Brush brush = c.IsBid ? _bidDx : _askDx;
-                        float radius  = (float)(MinBubbleRadius + persistRatio * (MaxBubbleRadius - MinBubbleRadius) * 0.6);
-                        brush.Opacity = (float)(MinOpacity + persistRatio * (MaxOpacity - MinOpacity)) * 0.6f;
+                        float radius  = (float)(MinBubbleRadius + persistRatio * (MaxBubbleRadius - MinBubbleRadius) * 0.5);
+                        brush.Opacity = (float)(MinOpacity + persistRatio * (MaxOpacity - MinOpacity)) * 0.5f;
                         float y = chartScale.GetYByValue(c.Price);
                         RenderTarget.DrawEllipse(new SharpDX.Direct2D1.Ellipse(new SharpDX.Vector2(x1, y), radius, radius), brush, 1.0f);
                     }
@@ -425,15 +425,22 @@ namespace NinjaTrader.NinjaScript.Indicators
             string text = string.Format("OrderFlowBubbles  |  {0}  |  {1}  |  levels tracked: {2}  |  strongest cluster: {3}{4}",
                                         State, l2, _clusters.Count, strongest, margin);
 
+            // bottom-right: bottom-left and top-right are where other indicators put their panels
             SharpDX.Direct2D1.Brush textBrush = chartControl.Properties.ChartText.ToDxBrush(RenderTarget);
-            DrawText(chartControl, text, ChartPanel.X + 10f, ChartPanel.Y + ChartPanel.H - 24f, textBrush);
+            DrawText(chartControl, text, ChartPanel.X + ChartPanel.W - 10f, ChartPanel.Y + ChartPanel.H - 24f, textBrush, true);
             textBrush.Dispose();
         }
 
         private void DrawText(ChartControl chartControl, string text, float x, float y, SharpDX.Direct2D1.Brush brush)
         {
+            DrawText(chartControl, text, x, y, brush, false);
+        }
+
+        private void DrawText(ChartControl chartControl, string text, float x, float y, SharpDX.Direct2D1.Brush brush, bool rightAlign)
+        {
             SharpDX.DirectWrite.TextFormat tf = chartControl.Properties.LabelFont.ToDirectWriteTextFormat();
             SharpDX.DirectWrite.TextLayout tl = new SharpDX.DirectWrite.TextLayout(Core.Globals.DirectWriteFactory, text, tf, 1600f, 24f);
+            if (rightAlign) x -= tl.Metrics.Width;
             RenderTarget.DrawTextLayout(new SharpDX.Vector2(x, y), tl, brush);
             tl.Dispose();
             tf.Dispose();
