@@ -11,6 +11,11 @@
 //      liquidity WAS building.
 //    • Column +6: the strongest clusters (largest persistent liquidity), with the current
 //      size written next to them and a thin line back to column +1.
+//    • Block-trade clusters: prices where at least BlockTradeThreshold contracts traded on
+//      one side in the current bar(s), grouped within ClusterRangeTicks, drawn as a band
+//      from the current bar across the right margin. Denser cluster = stronger band.
+//    • Icebergs: a book row of at least LargeOrderThreshold that gets eaten and refilled
+//      IcebergRefills times is marked with a diamond at +1 (hidden size at that price).
 //    • Optional: traded volume per price on the bars themselves (off by default).
 //
 //  Level 2 is live only — NinjaTrader stores no depth history, so nothing is drawn on
@@ -56,6 +61,21 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         private struct Row { public long Size; public bool IsBid; }
+
+        private class BlockCluster
+        {
+            public double Price, Top, Bottom, Volume;
+            public int    Intensity;
+        }
+
+        // refill tracking for one book price: eaten (size collapses) then restored = one refill
+        private class Ice
+        {
+            public long     Peak;
+            public bool     Dropped;
+            public int      Refills;
+            public DateTime Last;
+        }
         #endregion
 
         #region Fields
@@ -63,6 +83,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private readonly List<BookLevel> _asks = new List<BookLevel>();
         private readonly Dictionary<double, Cluster> _clusters = new Dictionary<double, Cluster>();
         private readonly Dictionary<int, Dictionary<double, Level>> _trades = new Dictionary<int, Dictionary<double, Level>>();
+        private readonly Dictionary<double, Ice> _ice = new Dictionary<double, Ice>();
 
         private int      _depthEvents;
         private DateTime _lastDepthTime = DateTime.MinValue;
@@ -77,7 +98,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private int      _lastSide = 1;
         private DateTime _lastRefresh = DateTime.MinValue;
 
-        private SharpDX.Direct2D1.Brush _bidDx, _askDx;
+        private SharpDX.Direct2D1.Brush _bidDx, _askDx, _blockDx, _iceDx;
         #endregion
 
         protected override void OnStateChange()
@@ -106,12 +127,24 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ShowTradeBubbles   = false;
                 ShowStatus         = true;
 
+                ShowBlockClusters   = true;
+                BlockTradeThreshold = 50;
+                ClusterRangeTicks   = 4;
+                BlockLookbackBars   = 1;
+
+                ShowIcebergs        = true;
+                LargeOrderThreshold = 100;
+                IcebergRefills      = 5;
+                IcebergWindowSec    = 300;
+
                 BidBrush           = Brushes.DeepSkyBlue;
                 AskBrush           = Brushes.OrangeRed;
+                BlockBrush         = Brushes.Gold;
+                IcebergBrush       = Brushes.Red;
             }
             else if (State == State.Configure)
             {
-                if (ShowTradeBubbles) AddDataSeries(BarsPeriodType.Tick, 1);
+                if (ShowTradeBubbles || ShowBlockClusters) AddDataSeries(BarsPeriodType.Tick, 1);
             }
             else if (State == State.DataLoaded)
             {
@@ -150,17 +183,51 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (e.Operation == Operation.Add)
                 {
                     if (e.Position <= side.Count) side.Insert(e.Position, new BookLevel { Price = e.Price, Volume = e.Volume });
+                    if (ShowIcebergs) TrackIceberg(e.Price, e.Volume, e.Time);
                 }
                 else if (e.Operation == Operation.Update)
                 {
                     if (e.Position < side.Count) { side[e.Position].Price = e.Price; side[e.Position].Volume = e.Volume; }
+                    if (ShowIcebergs) TrackIceberg(e.Price, e.Volume, e.Time);
                 }
                 else if (e.Operation == Operation.Remove)
                 {
-                    if (e.Position < side.Count) side.RemoveAt(e.Position);
+                    if (e.Position < side.Count)
+                    {
+                        double removed = side[e.Position].Price;
+                        side.RemoveAt(e.Position);
+                        if (ShowIcebergs) TrackIceberg(removed, 0, e.Time);
+                    }
                 }
             }
             RequestRefresh();
+        }
+
+        private void TrackIceberg(double price, long size, DateTime now)
+        {
+            double p = _mi.RoundToTickSize(price);
+            Ice ice;
+            if (!_ice.TryGetValue(p, out ice))
+            {
+                if (size < LargeOrderThreshold) return;
+                ice = new Ice { Peak = size, Last = now };
+                _ice[p] = ice;
+                return;
+            }
+
+            if ((now - ice.Last).TotalSeconds > IcebergWindowSec) { ice.Refills = 0; ice.Dropped = false; ice.Peak = 0; }
+
+            if (size >= LargeOrderThreshold)
+            {
+                if (ice.Dropped) { ice.Refills++; ice.Dropped = false; }
+                ice.Peak = Math.Max(ice.Peak, size);
+                ice.Last = now;
+            }
+            else if (ice.Peak >= LargeOrderThreshold && size <= ice.Peak / 2)
+            {
+                ice.Dropped = true;
+                ice.Peak    = 0;
+            }
         }
 
         private void Integrate(DateTime now)
@@ -283,6 +350,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
                 DateTime now = _lastDepthTime;
 
+                List<BlockCluster> blocks = ShowBlockClusters ? FindBlockClusters(lastDataBar) : new List<BlockCluster>();
+                if (blocks.Count > 0) DrawBlockClusters(chartControl, chartScale, blocks, x0, step);
+
                 // current rows (top DomDepth per side)
                 Dictionary<double, Row> rows = new Dictionary<double, Row>();
                 long sizeMax = 0;
@@ -345,8 +415,95 @@ namespace NinjaTrader.NinjaScript.Indicators
                     DrawText(chartControl, label, x6 + radius + 4f, y - 8f, brush);
                 }
 
-                if (ShowStatus) DrawStatus(chartControl, rows.Count, top, rows, colsThatFit);
+                int icebergs = ShowIcebergs ? DrawIcebergs(chartScale, chartControl, x1, now) : 0;
+
+                if (ShowStatus) DrawStatus(chartControl, rows.Count, top, rows, colsThatFit, blocks.Count, icebergs);
             }
+        }
+
+        // ---- block-trade clusters: big one-sided prints in the last bar(s), grouped by price ----
+        private List<BlockCluster> FindBlockClusters(int lastDataBar)
+        {
+            Dictionary<double, Level> sum = new Dictionary<double, Level>();
+            for (int b = lastDataBar - BlockLookbackBars + 1; b <= lastDataBar; b++)
+            {
+                Dictionary<double, Level> levels;
+                if (b < 0 || !_trades.TryGetValue(b, out levels)) continue;
+                foreach (Level lv in levels.Values)
+                {
+                    Level s;
+                    if (!sum.TryGetValue(lv.Price, out s)) { s = new Level { Price = lv.Price }; sum[lv.Price] = s; }
+                    s.BidVol += lv.BidVol;
+                    s.AskVol += lv.AskVol;
+                }
+            }
+
+            List<Level> blocks = new List<Level>();
+            foreach (Level s in sum.Values)
+                if (s.BidVol >= BlockTradeThreshold || s.AskVol >= BlockTradeThreshold) blocks.Add(s);
+            blocks.Sort(delegate(Level a, Level b) { return b.Price.CompareTo(a.Price); });
+
+            double range = ClusterRangeTicks * TickSize;
+            List<BlockCluster> result = new List<BlockCluster>();
+            List<Level> remaining = new List<Level>(blocks);
+            while (remaining.Count > 0)
+            {
+                double anchor = remaining[0].Price;
+                double priceSum = 0, volume = 0, top = double.MinValue, bottom = double.MaxValue;
+                int n = 0;
+                for (int i = remaining.Count - 1; i >= 0; i--)
+                {
+                    Level lv = remaining[i];
+                    if (Math.Abs(lv.Price - anchor) > range) continue;
+                    priceSum += lv.Price; volume += lv.Total; n++;
+                    top = Math.Max(top, lv.Price); bottom = Math.Min(bottom, lv.Price);
+                    remaining.RemoveAt(i);
+                }
+                BlockCluster c = new BlockCluster { Price = priceSum / n, Top = top, Bottom = bottom, Volume = volume };
+                foreach (Level lv in blocks) if (Math.Abs(lv.Price - c.Price) <= range) c.Intensity++;
+                result.Add(c);
+            }
+            return result;
+        }
+
+        private void DrawBlockClusters(ChartControl chartControl, ChartScale chartScale, List<BlockCluster> blocks, float x0, float step)
+        {
+            int maxIntensity = 1;
+            foreach (BlockCluster c in blocks) maxIntensity = Math.Max(maxIntensity, c.Intensity);
+
+            float xLeft  = x0 - step * 0.5f;
+            float xRight = x0 + 6.5f * step;
+            foreach (BlockCluster c in blocks)
+            {
+                float yTop    = chartScale.GetYByValue(c.Top    + 0.4 * TickSize);
+                float yBottom = chartScale.GetYByValue(c.Bottom - 0.4 * TickSize);
+                double ratio  = (double)c.Intensity / maxIntensity;
+
+                _blockDx.Opacity = (float)(0.10 + 0.35 * ratio);
+                RenderTarget.FillRectangle(new SharpDX.RectangleF(xLeft, yTop, xRight - xLeft, yBottom - yTop), _blockDx);
+                _blockDx.Opacity = 0.9f;
+                DrawText(chartControl, string.Format("{0:0} x{1}", c.Volume, c.Intensity), xRight + 4f, (yTop + yBottom) * 0.5f - 8f, _blockDx);
+            }
+        }
+
+        private int DrawIcebergs(ChartScale chartScale, ChartControl chartControl, float x1, DateTime now)
+        {
+            int count = 0;
+            float r = (float)(MaxBubbleRadius * 0.8);
+            foreach (KeyValuePair<double, Ice> kv in _ice)
+            {
+                Ice ice = kv.Value;
+                if (ice.Refills < IcebergRefills || (now - ice.Last).TotalSeconds > IcebergWindowSec) continue;
+                count++;
+                float y = chartScale.GetYByValue(kv.Key);
+                _iceDx.Opacity = 0.95f;
+                RenderTarget.DrawLine(new SharpDX.Vector2(x1, y - r), new SharpDX.Vector2(x1 + r, y), _iceDx, 2f);
+                RenderTarget.DrawLine(new SharpDX.Vector2(x1 + r, y), new SharpDX.Vector2(x1, y + r), _iceDx, 2f);
+                RenderTarget.DrawLine(new SharpDX.Vector2(x1, y + r), new SharpDX.Vector2(x1 - r, y), _iceDx, 2f);
+                RenderTarget.DrawLine(new SharpDX.Vector2(x1 - r, y), new SharpDX.Vector2(x1, y - r), _iceDx, 2f);
+                DrawText(chartControl, "ICE x" + ice.Refills, x1 + r + 4f, y - 8f, _iceDx);
+            }
+            return count;
         }
 
         private void AddRow(Dictionary<double, Row> rows, BookLevel b, bool isBid, ref long sizeMax)
@@ -407,7 +564,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
-        private void DrawStatus(ChartControl chartControl, int rowCount, List<Cluster> top, Dictionary<double, Row> rows, int colsThatFit)
+        private void DrawStatus(ChartControl chartControl, int rowCount, List<Cluster> top, Dictionary<double, Row> rows, int colsThatFit, int blockClusters, int icebergs)
         {
             string l2 = _depthEvents == 0
                 ? "L2: nothing received yet (needs a live connection with Level 2)"
@@ -422,8 +579,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
             string margin = colsThatFit >= 6 ? "" : string.Format("  |  right margin fits {0}/6 columns - widen it", Math.Max(colsThatFit, 0));
 
-            string text = string.Format("OrderFlowBubbles  |  {0}  |  {1}  |  levels tracked: {2}  |  strongest cluster: {3}{4}",
-                                        State, l2, _clusters.Count, strongest, margin);
+            string text = string.Format("OrderFlowBubbles  |  {0}  |  {1}  |  levels tracked: {2}  |  strongest cluster: {3}  |  block clusters: {4}  |  icebergs: {5}{6}",
+                                        State, l2, _clusters.Count, strongest, blockClusters, icebergs, margin);
 
             // bottom-right: bottom-left and top-right are where other indicators put their panels
             SharpDX.Direct2D1.Brush textBrush = chartControl.Properties.ChartText.ToDxBrush(RenderTarget);
@@ -449,14 +606,18 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void EnsureDx()
         {
             if (_bidDx != null) return;
-            _bidDx = (BidBrush ?? Brushes.DeepSkyBlue).ToDxBrush(RenderTarget);
-            _askDx = (AskBrush ?? Brushes.OrangeRed).ToDxBrush(RenderTarget);
+            _bidDx   = (BidBrush     ?? Brushes.DeepSkyBlue).ToDxBrush(RenderTarget);
+            _askDx   = (AskBrush     ?? Brushes.OrangeRed).ToDxBrush(RenderTarget);
+            _blockDx = (BlockBrush   ?? Brushes.Gold).ToDxBrush(RenderTarget);
+            _iceDx   = (IcebergBrush ?? Brushes.Red).ToDxBrush(RenderTarget);
         }
 
         private void ReleaseDx()
         {
-            if (_bidDx != null) { _bidDx.Dispose(); _bidDx = null; }
-            if (_askDx != null) { _askDx.Dispose(); _askDx = null; }
+            if (_bidDx   != null) { _bidDx.Dispose();   _bidDx   = null; }
+            if (_askDx   != null) { _askDx.Dispose();   _askDx   = null; }
+            if (_blockDx != null) { _blockDx.Dispose(); _blockDx = null; }
+            if (_iceDx   != null) { _iceDx.Dispose();   _iceDx   = null; }
         }
 
         public override void OnRenderTargetChanged()
@@ -499,6 +660,36 @@ namespace NinjaTrader.NinjaScript.Indicators
         public Brush AskBrush { get; set; }
         [Browsable(false)]
         public string AskBrushSerializable { get { return Serialize.BrushToString(AskBrush); } set { AskBrush = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore, Display(Name = "Block cluster color", GroupName = "3. Colors", Order = 3)]
+        public Brush BlockBrush { get; set; }
+        [Browsable(false)]
+        public string BlockBrushSerializable { get { return Serialize.BrushToString(BlockBrush); } set { BlockBrush = Serialize.StringToBrush(value); } }
+
+        [XmlIgnore, Display(Name = "Iceberg color", GroupName = "3. Colors", Order = 4)]
+        public Brush IcebergBrush { get; set; }
+        [Browsable(false)]
+        public string IcebergBrushSerializable { get { return Serialize.BrushToString(IcebergBrush); } set { IcebergBrush = Serialize.StringToBrush(value); } }
+
+        // 4. Block trades
+        [Display(Name = "Show block-trade clusters", Description = "Bands across the right margin where large one-sided prints clustered", GroupName = "4. Block trades", Order = 1)]
+        public bool ShowBlockClusters { get; set; }
+        [Range(1, 100000), Display(Name = "Block trade threshold (contracts)", Description = "Traded at bid OR at ask on one price to count as a block level", GroupName = "4. Block trades", Order = 2)]
+        public double BlockTradeThreshold { get; set; }
+        [Range(1, 100), Display(Name = "Cluster range (ticks)", Description = "Block levels this close together form one cluster", GroupName = "4. Block trades", Order = 3)]
+        public double ClusterRangeTicks { get; set; }
+        [Range(1, 50), Display(Name = "Bars included", Description = "1 = current bar only", GroupName = "4. Block trades", Order = 4)]
+        public int BlockLookbackBars { get; set; }
+
+        // 5. Icebergs
+        [Display(Name = "Show icebergs", Description = "Diamond at +1 where a large book row keeps getting eaten and refilled", GroupName = "5. Icebergs", Order = 1)]
+        public bool ShowIcebergs { get; set; }
+        [Range(1, 100000), Display(Name = "Large order threshold (contracts)", GroupName = "5. Icebergs", Order = 2)]
+        public int LargeOrderThreshold { get; set; }
+        [Range(1, 100), Display(Name = "Refills needed", Description = "Times the row must collapse and come back", GroupName = "5. Icebergs", Order = 3)]
+        public int IcebergRefills { get; set; }
+        [Range(10, 7200), Display(Name = "Iceberg window (sec)", Description = "Refills older than this are forgotten", GroupName = "5. Icebergs", Order = 4)]
+        public int IcebergWindowSec { get; set; }
         #endregion
     }
 }
